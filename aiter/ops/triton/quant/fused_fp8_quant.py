@@ -1,7 +1,7 @@
 from typing import Optional
 import torch
 import triton
-import aiter
+from aiter.utility import dtypes
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
     _fused_rms_fp8_per_tensor_static_quant_kernel,
     _fused_rms_fp8_group_quant_kernel,
@@ -18,7 +18,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-fp8_dtype = aiter.dtypes.fp8
+fp8_dtype = dtypes.fp8
 
 
 def fused_rms_fp8_per_tensor_static_quant(
