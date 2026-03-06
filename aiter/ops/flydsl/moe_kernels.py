@@ -104,6 +104,84 @@ def _register_all_configs():
 _register_all_configs()
 
 
+# ═══════════════════════════════════════════════════════════════
+# Blockscale (FP8 per_1x128) kernel configurations
+# ═══════════════════════════════════════════════════════════════
+
+SCALE_BLOCK_SIZE = 128
+
+
+def flydsl_blockscale_kernel_name(
+    stage: int,
+    out_dtype: str,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    mode: str = "",
+) -> str:
+    """Blockscale kernel name: flydsl_moe{stage}_afp8bs_wfp8bs_{out}_t{M}x{N}x{K}."""
+    name = f"flydsl_moe{stage}_afp8bs_wfp8bs_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
+    if mode:
+        name += f"_{mode}"
+    return name
+
+
+def get_flydsl_blockscale_stage1_kernels(out_dtype: str = "bf16") -> Dict[str, Dict]:
+    kernels = {}
+    for tm in [16, 32, 64]:
+        for tn in [128]:
+            for tk in [128]:
+                name = flydsl_blockscale_kernel_name(1, out_dtype, tm, tn, tk)
+                kernels[name] = {
+                    "stage": 1,
+                    "a_dtype": "fp8",
+                    "b_dtype": "fp8",
+                    "out_dtype": out_dtype,
+                    "tile_m": tm,
+                    "tile_n": tn,
+                    "tile_k": tk,
+                    "scale_mode": "blockscale",
+                    "MPerBlock": tm,
+                }
+    return kernels
+
+
+def get_flydsl_blockscale_stage2_kernels(out_dtype: str = "bf16") -> Dict[str, Dict]:
+    kernels = {}
+    for tm in [32, 64]:
+        for tn in [128]:
+            for tk in [128]:
+                for mode in ["atomic", "reduce"]:
+                    name = flydsl_blockscale_kernel_name(2, out_dtype, tm, tn, tk, mode)
+                    kernels[name] = {
+                        "stage": 2,
+                        "a_dtype": "fp8",
+                        "b_dtype": "fp8",
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "scale_mode": "blockscale",
+                        "mode": mode,
+                        "MPerBlock": tm,
+                    }
+    return kernels
+
+
+def _register_blockscale_configs():
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_blockscale_stage1_kernels(out))
+        _KERNEL_PARAMS.update(get_flydsl_blockscale_stage2_kernels(out))
+
+
+_register_blockscale_configs()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Compile helpers
+# ═══════════════════════════════════════════════════════════════
+
+
 def compile_flydsl_moe_stage1(
     model_dim: int,
     inter_dim: int,
@@ -150,6 +228,35 @@ def compile_flydsl_moe_stage1(
             in_dtype=a_dtype,
             out_dtype=out_dtype,
         )
+
+
+def compile_flydsl_moe_stage1_blockscale(
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    doweight_stage1: bool,
+    out_dtype: str = "bf16",
+):
+    """Compile stage1 blockscale kernel."""
+    from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+    return compile_moe_gemm1(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage1=doweight_stage1,
+        in_dtype="fp8",
+        out_dtype=out_dtype,
+        scale_mode="blockscale",
+    )
 
 
 def compile_flydsl_moe_stage2(
@@ -202,7 +309,40 @@ def compile_flydsl_moe_stage2(
         )
 
 
-# Private: compiled kernel closures
+def compile_flydsl_moe_stage2_blockscale(
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    doweight_stage2: bool,
+    out_dtype: str = "bf16",
+    accumulate: bool = True,
+):
+    """Compile stage2 blockscale kernel."""
+    from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+    return compile_moe_gemm2(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage2=doweight_stage2,
+        in_dtype="fp8",
+        out_dtype=out_dtype,
+        accumulate=accumulate,
+        scale_mode="blockscale",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# Compiled kernel caches
+# ═══════════════════════════════════════════════════════════════
 
 
 @functools.cache
@@ -286,6 +426,67 @@ def _get_compiled_stage1(
                 _k_in,
                 size_expert_ids_in,
             )
+
+    return tensor_api
+
+
+@functools.cache
+def _get_compiled_stage1_blockscale(
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    doweight: bool,
+    out_dtype: str,
+):
+    """Compile and cache blockscale stage1 kernel."""
+    exe = compile_flydsl_moe_stage1_blockscale(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage1=doweight,
+        out_dtype=out_dtype,
+    )
+    _n_in = inter_dim
+    _k_in = model_dim
+
+    def tensor_api(
+        out: torch.Tensor,
+        a: torch.Tensor,
+        w: torch.Tensor,
+        a_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        sorted_expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_valid_ids: torch.Tensor,
+        token_num: int,
+        size_expert_ids_in: int,
+    ) -> None:
+        k_blocks = model_dim // SCALE_BLOCK_SIZE
+        exe(
+            out,
+            a,
+            w,
+            a_scale,
+            w_scale,
+            sorted_ids,
+            sorted_expert_ids,
+            topk_weights,
+            num_valid_ids,
+            token_num,
+            _n_in,
+            _k_in,
+            size_expert_ids_in,
+            k_blocks,
+        )
 
     return tensor_api
 
@@ -405,7 +606,100 @@ def _get_compiled_stage2(
     return tensor_api
 
 
+@functools.cache
+def _get_compiled_stage2_blockscale(
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    doweight: bool,
+    out_dtype: str,
+    accumulate: bool = True,
+):
+    """Compile and cache blockscale stage2 kernel."""
+    exe = compile_flydsl_moe_stage2_blockscale(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage2=doweight,
+        out_dtype=out_dtype,
+        accumulate=accumulate,
+    )
+    _n_in = model_dim
+    _k_in = inter_dim
+
+    reduce_exe = None
+    if not accumulate:
+        from .kernels.moe_gemm_2stage import compile_moe_reduction
+
+        reduce_exe = compile_moe_reduction(
+            topk=topk,
+            model_dim=model_dim,
+            dtype_str=out_dtype,
+        )
+
+    def tensor_api(
+        out: torch.Tensor,
+        a: torch.Tensor,
+        w: torch.Tensor,
+        a_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        sorted_expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_valid_ids: torch.Tensor,
+        token_num: int,
+        blocks: int,
+    ) -> None:
+        k_blocks = inter_dim // SCALE_BLOCK_SIZE
+        if accumulate:
+            target = out
+        else:
+            target = torch.empty(
+                (token_num * topk * model_dim,),
+                device=out.device,
+                dtype=out.dtype,
+            )
+
+        exe(
+            target,
+            a,
+            w,
+            a_scale,
+            w_scale,
+            sorted_ids,
+            sorted_expert_ids,
+            topk_weights,
+            num_valid_ids,
+            token_num,
+            _n_in,
+            _k_in,
+            blocks,
+            k_blocks,
+        )
+
+        if not accumulate:
+            stream = torch.cuda.current_stream().cuda_stream
+            reduce_exe(
+                target.view(token_num, topk, model_dim),
+                out,
+                token_num,
+                stream,
+            )
+
+    return tensor_api
+
+
+# ═══════════════════════════════════════════════════════════════
 # Public API
+# ═══════════════════════════════════════════════════════════════
 
 
 def flydsl_moe_stage1(
@@ -490,6 +784,82 @@ def flydsl_moe_stage1(
     return out
 
 
+def flydsl_moe_stage1_blockscale(
+    a: torch.Tensor,
+    w1: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    topk: int = 1,
+    *,
+    tile_m: int = 32,
+    tile_n: int = 128,
+    tile_k: int = 128,
+    out_dtype: str = "bf16",
+    w1_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    sorted_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Blockscale FP8 MoE stage1 (gate+up with SiLU).
+
+    Scales are 2D blockscale tensors, flattened to 1D for the kernel.
+    a_scale: (token_num, model_dim // 128) f32 -> flatten
+    w_scale: (E * 2*inter_dim // 128, model_dim // 128) f32 -> flatten
+    """
+    token_num = a.shape[0]
+    E = w1.shape[0]
+    inter_dim = w1.shape[1] // 2
+    model_dim = a.shape[1]
+
+    torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
+
+    if out is None:
+        out = torch.empty(
+            (token_num, topk, inter_dim), dtype=torch_out_dtype, device=a.device
+        )
+
+    dev = a.device
+    flat_a_scale = (
+        a1_scale.view(-1) if a1_scale is not None else torch.empty(0, device=dev)
+    )
+    flat_w_scale = (
+        w1_scale.view(-1) if w1_scale is not None else torch.empty(0, device=dev)
+    )
+    sw = (
+        sorted_weights
+        if sorted_weights is not None
+        else torch.empty(0, device=dev, dtype=torch.float32)
+    )
+
+    tensor_api = _get_compiled_stage1_blockscale(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight=(sorted_weights is not None),
+        out_dtype=out_dtype,
+    )
+    tensor_api(
+        out.view(-1),
+        a.view(-1),
+        w1.view(-1),
+        flat_a_scale,
+        flat_w_scale,
+        sorted_token_ids,
+        sorted_expert_ids,
+        sw,
+        num_valid_ids,
+        token_num,
+        sorted_expert_ids.shape[0],
+    )
+
+    return out
+
+
 def flydsl_moe_stage2(
     inter_states: torch.Tensor,
     w2: torch.Tensor,
@@ -552,6 +922,82 @@ def flydsl_moe_stage2(
         doweight=(sorted_weights is not None),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        accumulate=accumulate,
+    )
+    tensor_api(
+        out,
+        inter_states,
+        w2,
+        a2_scale,
+        w2_scale,
+        sorted_token_ids,
+        sorted_expert_ids,
+        sw,
+        num_valid_ids,
+        token_num,
+        int(sorted_expert_ids.numel()),
+    )
+
+    return out
+
+
+def flydsl_moe_stage2_blockscale(
+    inter_states: torch.Tensor,
+    w2: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    topk: int = 1,
+    *,
+    tile_m: int = 32,
+    tile_n: int = 128,
+    tile_k: int = 128,
+    out_dtype: str = "bf16",
+    mode: str = "atomic",
+    w2_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    sorted_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Blockscale FP8 MoE stage2 (down projection).
+
+    Scales are 2D blockscale tensors, flattened to 1D for the kernel.
+    a_scale: (token_num * topk, inter_dim // 128) f32 -> flatten
+    w_scale: (E * model_dim // 128, inter_dim // 128) f32 -> flatten
+    """
+    token_num = inter_states.shape[0]
+    E = w2.shape[0]
+    model_dim = w2.shape[1]
+    inter_dim = inter_states.shape[2]
+
+    accumulate = mode != "reduce"
+
+    torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
+
+    if out is None:
+        out = torch.zeros(
+            (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
+        )
+    elif accumulate:
+        out.zero_()
+
+    dev = inter_states.device
+    sw = (
+        sorted_weights
+        if sorted_weights is not None
+        else torch.zeros(sorted_token_ids.shape, dtype=torch.float32, device=dev)
+    )
+
+    tensor_api = _get_compiled_stage2_blockscale(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight=(sorted_weights is not None),
         out_dtype=out_dtype,
         accumulate=accumulate,
     )
