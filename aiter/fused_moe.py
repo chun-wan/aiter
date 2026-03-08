@@ -32,6 +32,7 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+_USE_FLYDSL_MOE_BLOCKSCALE = os.environ.get("AITER_USE_FLYDSL_MOE_BLOCKSCALE", "0") == "1"
 
 
 def _moe_sorting_impl(
@@ -467,11 +468,14 @@ def fused_moe_1stage(
             w2_scale = w2_scale.view(E, -1)
 
         if quant_type == QuantType.per_1x128:
-            fmoe_func = functools.partial(
-                aiter.fmoe_fp8_blockscale_g1u1,
-                fc_scale_blkn=128,
-                fc_scale_blkk=128,
-            )
+            if _USE_FLYDSL_MOE_BLOCKSCALE and is_flydsl_available():
+                fmoe_func = _flydsl_blockscale_moe_dispatch
+            else:
+                fmoe_func = functools.partial(
+                    aiter.fmoe_fp8_blockscale_g1u1,
+                    fc_scale_blkn=128,
+                    fc_scale_blkk=128,
+                )
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
         else:
@@ -567,6 +571,98 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 cfg_2stages = None
 # fmt: off
+
+def _flydsl_blockscale_moe_dispatch(
+    moe_buf,
+    a1,
+    w1,
+    w2,
+    sorted_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    *,
+    w1_scale=None,
+    w2_scale=None,
+    a1_scale=None,
+    a2_scale=None,
+    sorted_weights=None,
+    fc_scale_blkn=128,
+    fc_scale_blkk=128,
+    **kwargs,
+):
+    """FlyDSL blockscale MoE dispatch for QuantType.per_1x128.
+
+    Reshapes CK-format scales to FlyDSL flat format and calls FlyDSL blockscale kernels.
+    CK scale format: a_scale is (tokens, K//128) row-major (already transposed by fused_moe)
+                     w_scale is (E, N, K//128) or (E, N//128, K//128)
+    FlyDSL format:   a_scale flattened, w_scale flattened as (E * N_blocks, K_blocks)
+    """
+    from aiter.ops.flydsl.moe_kernels import (
+        flydsl_moe_stage1_blockscale,
+        flydsl_moe_stage2_blockscale,
+    )
+
+    token_num = a1.shape[0]
+    E = w1.shape[0]
+    model_dim = a1.shape[1]
+    inter_dim_2x = w1.shape[1]
+    inter_dim = inter_dim_2x // 2
+
+    # Stage 1: gate+up projection
+    stage1_out = flydsl_moe_stage1_blockscale(
+        a=a1,
+        w1=w1,
+        sorted_token_ids=sorted_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=None,
+        topk=topk,
+        tile_m=32,
+        tile_n=128,
+        tile_k=128,
+        out_dtype="bf16",
+        w1_scale=w1_scale,
+        a1_scale=a1_scale,
+        sorted_weights=sorted_weights,
+    )
+
+    # Quantize stage1 output for stage2
+    a2 = stage1_out.view(-1, inter_dim)
+    if a2.dtype != torch.float8_e4m3fnuz:
+        from aiter import get_hip_quant as get_quant
+        quant_fn = functools.partial(get_quant(QuantType.per_1x128), transpose_scale=True)
+        a2, a2_scale_new = quant_fn(
+            a2.to(torch.bfloat16),
+            quant_dtype=torch.float8_e4m3fnuz,
+        )
+    else:
+        a2_scale_new = a2_scale
+
+    # Stage 2: down projection
+    stage2_out = flydsl_moe_stage2_blockscale(
+        inter_states=a2.view(token_num, topk, inter_dim),
+        w2=w2,
+        sorted_token_ids=sorted_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out.view(token_num, -1) if out.dim() != 2 else out,
+        topk=topk,
+        tile_m=32,
+        tile_n=128,
+        tile_k=128,
+        out_dtype="bf16",
+        mode="atomic",
+        w2_scale=w2_scale,
+        a2_scale=a2_scale_new,
+        sorted_weights=sorted_weights,
+    )
+
+    return out
+
+
+
 fused_moe_1stage_dict = {
     "gfx942":
     {
