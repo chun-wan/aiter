@@ -52,8 +52,15 @@ def compile_moe_gemm1(
     in_dtype: str = "fp8",
     out_dtype: str = "f16",
     use_cshuffle_epilog: bool | None = None,
+    scale_mode: str = "per_token",
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
+
+    scale_mode:
+      - "per_token": standard per-token/per-row scales (default)
+      - "blockscale": per 128x128 block scales (FP8 blockscale / per_1x128)
+        scale_x: [tokens * (K//128)] flattened, scale_w: [(E*2*inter_dim//128) * (K//128)] flattened
+    
 
     in_dtype:
       - "fp8": X/W are fp8
@@ -80,6 +87,10 @@ def compile_moe_gemm1(
         return T.f16() if out_dtype == "f16" else T.bf16()
 
     tile_k_bytes = int(tile_k) * int(elem_bytes)
+    _SCALE_BLOCK_SIZE = 128
+    _is_blockscale = (scale_mode == "blockscale")
+    _k_blocks_stage1 = model_dim // _SCALE_BLOCK_SIZE if _is_blockscale else 0
+    _scale_w_size_bs = (experts * (2 * inter_dim) // _SCALE_BLOCK_SIZE) * _k_blocks_stage1 if _is_blockscale else 0
     # K64-byte micro-step: always 64 bytes per `ku`. For fp16 this is 32 elements.
     if (tile_k_bytes % 64) != 0:
         raise ValueError(
@@ -150,9 +161,10 @@ def compile_moe_gemm1(
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
     # Keep an explicit ABI tag so signature changes can't accidentally reuse an old binary.
+    _bs_tag = "_bs" if scale_mode == "blockscale" else ""
     module_name = (
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_bs_tag}"
         f"_abi3"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
     ).replace("-", "_")
 
@@ -189,7 +201,10 @@ def compile_moe_gemm1(
                 DYN, I.f16 if is_f16 else (I.i8 if is_int8 else I.f8)
             ),
             arg_scale_x: lambda: T.memref(DYN, T.f32()),
-            arg_scale_w: lambda: T.memref(experts * (2 * inter_dim), T.f32()),
+            arg_scale_w: lambda: T.memref(
+                _scale_w_size_bs if _is_blockscale else experts * (2 * inter_dim),
+                T.f32(),
+            ),
             arg_sorted_token_ids: lambda: T.memref(DYN, T.i32()),
             arg_expert_ids: lambda: T.memref(DYN, T.i32()),
             arg_sorted_weights: lambda: T.memref(DYN, T.f32()),
@@ -198,6 +213,7 @@ def compile_moe_gemm1(
             inter_in: lambda: T.index(),
             k_in: lambda: T.index(),
             size_expert_ids_in: lambda: T.index(),
+            k_blocks_in: lambda: T.index(),
         ):
             x_elem = I.f16 if is_f16 else (I.i8 if is_int8 else I.f8)
             # For int4, weights are stored as packed bytes (i8) and unpacked to i8 packs.
@@ -606,6 +622,12 @@ def compile_moe_gemm1(
                 acc_gate = [acc_init] * (num_acc_n * m_repeat)
                 acc_up = [acc_init] * (num_acc_n * m_repeat)
 
+                # Blockscale: main accumulators for scaled partial sums
+                _bs = bool(False if not _is_blockscale else True)
+                if _bs:
+                    main_gate = [acc_init] * (num_acc_n * m_repeat)
+                    main_up = [acc_init] * (num_acc_n * m_repeat)
+
                 # ---- Pipeline helpers: store X tile to LDS with ping-pong base ----
                 def store_x_tile_to_lds(vec_x_in_parts, lds_base):
                     for i in range_constexpr(num_x_loads):
@@ -828,6 +850,64 @@ def compile_moe_gemm1(
                             rocdl.sched_dswr(1)
                     rocdl.sched_barrier(0)
 
+                # ---- Blockscale accumulation helper ----
+                def _blockscale_scale_and_accumulate(
+                    main_g, main_u, tile_g, tile_u, k_offset
+                ):
+                    """Scale tile accumulators by blockscale values and add to main accumulators."""
+                    if not _bs:
+                        return tile_g, tile_u
+                    c_sbs = arith.constant(_SCALE_BLOCK_SIZE, index=True)
+                    kb = k_offset / c_sbs
+                    kb_i32 = arith.index_cast(i32, kb)
+                    c_kb = arith.index_cast(i32, arith.constant(_k_blocks_stage1, index=True))
+
+                    for _mi in range_constexpr(m_repeat):
+                        mi_val_sc = arith.constant(_mi * 16, index=True)
+                        row_sc = bx_m + mi_val_sc + lane_div_16
+                        fused2_sc = buffer_ops.buffer_load(sorted_rsrc, row_sc, vec_width=1, dtype=i32)
+                        t2_sc = fused2_sc & arith.i32(0xFFFFFF)
+                        t_valid_sc = arith.cmpu(t2_sc, tokens_i32, "ult")
+                        sx_idx = t2_sc * c_kb + kb_i32
+                        sx_val = arith.select(
+                            t_valid_sc,
+                            buffer_ops.buffer_load(sx_rsrc, sx_idx, vec_width=1, dtype=f32),
+                            arith.f32(0.0),
+                        )
+
+                        for _ni in range_constexpr(num_acc_n):
+                            col_g_sc = col_g_list[_ni]
+                            row_w_gate = expert_off_idx + col_g_sc
+                            row_w_up = row_w_gate + inter_idx
+                            n_blk_gate_sc = arith.index_cast(i32, row_w_gate / arith.constant(_SCALE_BLOCK_SIZE, index=True))
+                            n_blk_up_sc = arith.index_cast(i32, row_w_up / arith.constant(_SCALE_BLOCK_SIZE, index=True))
+                            sw_gate_idx = n_blk_gate_sc * c_kb + kb_i32
+                            sw_up_idx = n_blk_up_sc * c_kb + kb_i32
+                            sw_gate_val = buffer_ops.buffer_load(sw_rsrc, sw_gate_idx, vec_width=1, dtype=f32)
+                            sw_up_val = buffer_ops.buffer_load(sw_rsrc, sw_up_idx, vec_width=1, dtype=f32)
+                            scale_gate = sx_val * sw_gate_val
+                            scale_up = sx_val * sw_up_val
+
+                            acc_idx_sc = _mi * num_acc_n + _ni
+                            for _ii in range_constexpr(4):
+                                vg_sc = vector.extract(tile_g[acc_idx_sc], static_position=[_ii], dynamic_position=[])
+                                vu_sc = vector.extract(tile_u[acc_idx_sc], static_position=[_ii], dynamic_position=[])
+                                mg_sc = vector.extract(main_g[acc_idx_sc], static_position=[_ii], dynamic_position=[])
+                                mu_sc = vector.extract(main_u[acc_idx_sc], static_position=[_ii], dynamic_position=[])
+                                main_g[acc_idx_sc] = vector.insert(
+                                    mg_sc + vg_sc * scale_gate,
+                                    main_g[acc_idx_sc],
+                                    static_position=[_ii],
+                                    dynamic_position=[],
+                                )
+                                main_u[acc_idx_sc] = vector.insert(
+                                    mu_sc + vu_sc * scale_up,
+                                    main_u[acc_idx_sc],
+                                    static_position=[_ii],
+                                    dynamic_position=[],
+                                )
+                    return main_g, main_u
+
                 # Prologue: prefetch tile0, store to LDS(cur), sync.
                 k0 = arith.index(0)
                 x_regs0 = load_x_tile(k0)
@@ -865,6 +945,12 @@ def compile_moe_gemm1(
                         lds_base_pong,
                         a0_prefetch=a0_prefetch_pong,
                     )
+                    if _bs:
+                        main_gate, main_up = _blockscale_scale_and_accumulate(
+                            main_gate, main_up, acc_gate, acc_up, k_iv,
+                        )
+                        acc_gate = [acc_init] * (num_acc_n * m_repeat)
+                        acc_up = [acc_init] * (num_acc_n * m_repeat)
                     a0_prefetch_pong = None
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
@@ -889,6 +975,13 @@ def compile_moe_gemm1(
                         lds_base_ping,
                         a0_prefetch=a0_prefetch_ping,
                     )
+                    if _bs:
+                        next_k1_bs = k_iv + arith.constant(tile_k, index=True)
+                        main_gate, main_up = _blockscale_scale_and_accumulate(
+                            main_gate, main_up, acc_gate, acc_up, next_k1_bs,
+                        )
+                        acc_gate = [acc_init] * (num_acc_n * m_repeat)
+                        acc_up = [acc_init] * (num_acc_n * m_repeat)
                     a0_prefetch_ping = None
                     store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                     hot_loop_scheduler()
@@ -917,6 +1010,13 @@ def compile_moe_gemm1(
                     lds_base_pong,
                     a0_prefetch=a0_prefetch_pong,
                 )
+                if _bs:
+                    k_tail0_bs = k_in - arith.constant(tile_k * 2, index=True)
+                    main_gate, main_up = _blockscale_scale_and_accumulate(
+                        main_gate, main_up, acc_gate, acc_up, k_tail0_bs,
+                    )
+                    acc_gate = [acc_init] * (num_acc_n * m_repeat)
+                    acc_up = [acc_init] * (num_acc_n * m_repeat)
                 a0_prefetch_pong = None
                 store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                 hot_loop_scheduler()
@@ -934,9 +1034,16 @@ def compile_moe_gemm1(
                     b_gate_ping,
                     b_up_ping,
                     lds_base_ping,
-                    prefetch_epilogue=True,
+                    prefetch_epilogue=(not _bs),
                     a0_prefetch=a0_prefetch_ping,
                 )
+                if _bs:
+                    k_tail1_bs = k_in - arith.constant(tile_k, index=True)
+                    main_gate, main_up = _blockscale_scale_and_accumulate(
+                        main_gate, main_up, acc_gate, acc_up, k_tail1_bs,
+                    )
+                    acc_gate = main_gate
+                    acc_up = main_up
 
                 # Store epilogue to out[t, slot, inter]
                 expert_off = expert_off_idx
@@ -1043,8 +1150,9 @@ def compile_moe_gemm1(
                             if is_int8:
                                 vg = arith.sitofp(f32, vg)
                                 vu = arith.sitofp(f32, vu)
-                            vg = vg * sx * sw_gate
-                            vu = vu * sx * sw_up
+                            if not _bs:
+                                vg = vg * sx * sw_gate
+                                vu = vu * sx * sw_up
 
                             y = silu(vg) * vu
                             if doweight_stage1:
@@ -1161,8 +1269,9 @@ def compile_moe_gemm1(
                             if is_int8:
                                 vg = arith.sitofp(f32, vg)
                                 vu = arith.sitofp(f32, vu)
-                            vg = vg * sx * sw_gate
-                            vu = vu * sx * sw_up
+                            if not _bs:
+                                vg = vg * sx * sw_gate
+                                vu = vu * sx * sw_up
 
                             y = silu(vg) * vu
                             if doweight_stage1:
@@ -1384,8 +1493,9 @@ def compile_moe_gemm2(
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
     # Dynamic-shape variant: safe to reuse across (tokens/sorted_size/size_expert_ids) at runtime.
     # Keep a distinct ABI tag so the compile cache never mixes with historical signatures.
+    _bs_tag_s2 = "_bs" if _is_blockscale_s2 else ""
     module_name = (
-        f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
+        f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}{_bs_tag_s2}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_abi2"  # mask sentinel token ids on loads/stores to avoid illegal address faults
     ).replace("-", "_")
@@ -1425,7 +1535,10 @@ def compile_moe_gemm2(
                 size_w, I.f16 if is_f16 else (I.i8 if is_int8 else I.f8)
             ),
             arg_scale_x: lambda: T.memref(size_scale_x, T.f32()),
-            arg_scale_w: lambda: T.memref(experts * model_dim, T.f32()),
+            arg_scale_w: lambda: T.memref(
+                _scale_w_size_bs_s2 if _is_blockscale_s2 else experts * model_dim,
+                T.f32(),
+            ),
             arg_sorted_token_ids: lambda: T.memref(size_sorted, T.i32()),
             arg_expert_ids: lambda: T.memref(size_expert_ids_shape, T.i32()),
             arg_sorted_weights: lambda: T.memref(size_sorted, T.f32()),
@@ -2110,6 +2223,9 @@ def compile_moe_gemm2(
                 gpu.barrier()
 
                 acc = [acc_init] * (num_acc_n * m_repeat)
+                _bs_s2 = bool(_is_blockscale_s2)
+                if _bs_s2:
+                    main_acc = [acc_init] * (num_acc_n * m_repeat)
                 lds_base_pong = lds_base_cur
                 lds_base_ping = lds_base_nxt
 
@@ -2118,6 +2234,50 @@ def compile_moe_gemm2(
                 a0_prefetch_pong = lds_load_packs_k64(
                     row_a_lds, col_offset_base_bytes, lds_base_pong
                 )
+
+                # ---- Stage2 blockscale accumulation helper ----
+                def _bs_s2_scale_acc(main_a, tile_a, k_offset):
+                    if not _bs_s2:
+                        return tile_a
+                    c_sbs2 = arith.constant(_SCALE_BLOCK_SIZE_S2, index=True)
+                    kb2 = k_offset / c_sbs2
+                    kb2_i32 = arith.index_cast(i32, kb2)
+                    c_kb2 = arith.index_cast(i32, arith.constant(_k_blocks_s2, index=True))
+
+                    for _mi in range_constexpr(m_repeat):
+                        mi_val2 = arith.constant(_mi * 16, index=True)
+                        row2 = bx_m + mi_val2 + lane_div_16
+                        fused2_s2 = buffer_ops.buffer_load(sorted_rsrc, row2, vec_width=1, dtype=i32)
+                        t2_s2 = fused2_s2 & arith.i32(0xFFFFFF)
+                        s2_s2 = fused2_s2 >> 24
+                        ts2_s2 = t2_s2 * topk_i32 + s2_s2
+                        t_ok2 = arith.cmpu(t2_s2, tokens_i32, "ult")
+                        sx_idx2 = ts2_s2 * c_kb2 + kb2_i32
+                        sx_v2 = arith.select(
+                            t_ok2,
+                            buffer_ops.buffer_load(sx_rsrc, sx_idx2, vec_width=1, dtype=f32),
+                            arith.f32(0.0),
+                        )
+
+                        for _ni in range_constexpr(num_acc_n):
+                            col_g2 = col_g_list[_ni]
+                            row_w2 = expert_off_idx + col_g2
+                            n_blk2 = arith.index_cast(i32, row_w2 / arith.constant(_SCALE_BLOCK_SIZE_S2, index=True))
+                            sw_idx2 = n_blk2 * c_kb2 + kb2_i32
+                            sw_v2 = buffer_ops.buffer_load(sw_rsrc, sw_idx2, vec_width=1, dtype=f32)
+                            scale2 = sx_v2 * sw_v2
+
+                            acc_idx2 = _mi * num_acc_n + _ni
+                            for _ii in range_constexpr(4):
+                                vt = vector.extract(tile_a[acc_idx2], static_position=[_ii], dynamic_position=[])
+                                vm = vector.extract(main_a[acc_idx2], static_position=[_ii], dynamic_position=[])
+                                main_a[acc_idx2] = vector.insert(
+                                    vm + vt * scale2,
+                                    main_a[acc_idx2],
+                                    static_position=[_ii],
+                                    dynamic_position=[],
+                                )
+                    return main_a
 
                 # Main loop: process K tiles in 2-tile ping-pong steps.
                 #
@@ -2141,6 +2301,9 @@ def compile_moe_gemm2(
                     acc, _ = compute_tile(
                         acc, b_cur, lds_base_pong, a0_prefetch=a0_prefetch_pong
                     )
+                    if _bs_s2:
+                        main_acc = _bs_s2_scale_acc(main_acc, acc, k_iv)
+                        acc = [acc_init] * (num_acc_n * m_repeat)
                     a0_prefetch_pong = None
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
@@ -2158,6 +2321,10 @@ def compile_moe_gemm2(
                     acc, _ = compute_tile(
                         acc, b_ping, lds_base_ping, a0_prefetch=a0_prefetch_ping
                     )
+                    if _bs_s2:
+                        next_k1_s2 = k_iv + arith.constant(tile_k, index=True)
+                        main_acc = _bs_s2_scale_acc(main_acc, acc, next_k1_s2)
+                        acc = [acc_init] * (num_acc_n * m_repeat)
                     a0_prefetch_ping = None
                     store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                     hot_loop_scheduler()
@@ -2176,9 +2343,13 @@ def compile_moe_gemm2(
                         acc,
                         b_cur,
                         lds_base_pong,
-                        prefetch_epilogue=True,
+                        prefetch_epilogue=(not _bs_s2),
                         a0_prefetch=a0_prefetch_pong,
                     )
+                    if _bs_s2:
+                        tail_k_odd = arith.constant((num_k_tiles_py - 1) * int(tile_k), index=True)
+                        main_acc = _bs_s2_scale_acc(main_acc, acc, tail_k_odd)
+                        acc = main_acc
                 else:
                     # Tail: 2 remaining tiles.
                     k_tail1 = k_in - tile_k
@@ -2188,6 +2359,10 @@ def compile_moe_gemm2(
                     acc, _ = compute_tile(
                         acc, b_cur, lds_base_pong, a0_prefetch=a0_prefetch_pong
                     )
+                    if _bs_s2:
+                        tail_k_even0 = k_in - arith.constant(tile_k * 2, index=True)
+                        main_acc = _bs_s2_scale_acc(main_acc, acc, tail_k_even0)
+                        acc = [acc_init] * (num_acc_n * m_repeat)
                     a0_prefetch_pong = None
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
@@ -2201,9 +2376,13 @@ def compile_moe_gemm2(
                         acc,
                         b_ping,
                         lds_base_ping,
-                        prefetch_epilogue=True,
+                        prefetch_epilogue=(not _bs_s2),
                         a0_prefetch=a0_prefetch_ping,
                     )
+                    if _bs_s2:
+                        tail_k_even1 = k_in - arith.constant(tile_k, index=True)
+                        main_acc = _bs_s2_scale_acc(main_acc, acc, tail_k_even1)
+                        acc = main_acc
 
                 # ---------------- Epilogue: LDS CShuffle + atomic half2 (x2) ----------------
                 # Reuse the shared helper so GEMM / MoE kernels share the exact same CShuffle skeleton.
@@ -2297,7 +2476,8 @@ def compile_moe_gemm2(
                             )
                             if is_int8:
                                 v = arith.sitofp(f32, v)
-                            v = v * sx * sw
+                            if not _bs_s2:
+                                v = v * sx * sw
                             if doweight_stage2:
                                 v = v * tw
                             col_i32 = arith.index_cast(i32, col_g)
@@ -2379,7 +2559,8 @@ def compile_moe_gemm2(
                             )
                             if is_int8:
                                 v = arith.sitofp(f32, v)
-                            v = v * sx * sw
+                            if not _bs_s2:
+                                v = v * sx * sw
                             if doweight_stage2:
                                 v = v * tw
                             v_out = arith.trunc_f(out_elem(), v)
