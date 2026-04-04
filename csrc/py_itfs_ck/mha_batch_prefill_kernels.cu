@@ -583,8 +583,8 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     const int total_q = q.size(0);
 
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
-    TORCH_CHECK(head_size_q <= 256, "CK only supports head dimension at most 256");
-    TORCH_CHECK(head_size_v <= 256, "CK only supports head dimension at most 256");
+    TORCH_CHECK(head_size_q <= 512, "CK only supports head dimension at most 512");
+    TORCH_CHECK(head_size_v <= 512, "CK only supports head dimension at most 512");
     TORCH_CHECK(head_size_q % k_vector_size == 0,
                 "query, key, value, and out_ must have a head_size that is a multiple of ",
                 k_vector_size);

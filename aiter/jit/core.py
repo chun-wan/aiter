@@ -375,7 +375,10 @@ HIP_KITTENS_DIR = os.environ.get(
 
 @functools.lru_cache(maxsize=1)
 def get_asm_dir():
-    return os.path.join(AITER_ASM_DIR, get_gfx())
+    asm_path = os.path.join(AITER_ASM_DIR, get_gfx())
+    if not os.path.isdir(asm_path):
+        return None
+    return asm_path
 
 
 @functools.lru_cache(maxsize=1)
@@ -794,6 +797,12 @@ def build_module(
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
+
+        _no_fp8_archs = {"gfx90a", "gfx908"}
+        if all(a in _no_fp8_archs for a in archs):
+            flags_hip = [f for f in flags_hip if "ENABLE_FP8" not in f]
+            flags_cc = [f for f in flags_cc if "ENABLE_FP8" not in f]
+
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]

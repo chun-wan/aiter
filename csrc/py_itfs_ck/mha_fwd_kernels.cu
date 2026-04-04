@@ -244,8 +244,8 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     const int seqlen_k = k.size(1);
     const int num_heads_k = k.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size_q <= 256, "CK only supports head dimension at most 256");
-    TORCH_CHECK(head_size_v <= 256, "CK only supports head dimension at most 256");
+    TORCH_CHECK(head_size_q <= 512, "CK only supports head dimension at most 512");
+    TORCH_CHECK(head_size_v <= 512, "CK only supports head dimension at most 512");
     TORCH_CHECK(head_size_q % 8 == 0, "query, key, value, and out_ must have a head_size_q that is a multiple of 8");
     TORCH_CHECK(head_size_v % 8 == 0, "query, key, value, and out_ must have a head_size_q that is a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");

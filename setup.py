@@ -145,6 +145,28 @@ def _load_modules_from_config():
     return []
 
 
+def _is_gfx90a_build():
+    """Check if we are targeting gfx90a (MI250/MI250X) which lacks FP8 and ASM support."""
+    archs = os.environ.get("GPU_ARCHS", "native")
+    return "gfx90a" in archs
+
+
+_GFX90A_EXCLUDE_PATTERNS = (
+    "_asm",           # all ASM modules (no gfx90a ISA binaries)
+    "a8w8",           # FP8 quantized GEMM
+    "a4w4",           # INT4/FP4 quantized GEMM
+    "blockscale",     # FP8 block-scale GEMM
+    "bpreshuffle",    # FP8 block pre-shuffle
+    "deepgemm",       # FP8 deep GEMM
+    "fmha_v3",        # CK FMHA v3 (ASM-only, gfx942/gfx950)
+    "fp8gemm",        # FP8 GEMM codegen
+    "mla_asm",        # MLA ASM kernels
+    "hipbsolgemm",    # hipBLAS FP8 GEMM
+    "hk_mla",         # HipKittens MLA (FP8-dependent)
+    "cktile_gemm",    # CK tile GEMM (FP8 variants)
+)
+
+
 def get_exclude_ops():
     all_modules = _load_modules_from_config()
     exclude_ops = []
@@ -154,7 +176,17 @@ def get_exclude_ops():
         exclude_ops.extend(sorted(core._get_ck_exclude_modules()))
         return exclude_ops
 
+    # gfx90a (MI250): exclude FP8, ASM, and architecture-specific modules
+    is_gfx90a = _is_gfx90a_build()
+    if is_gfx90a:
+        for module in all_modules:
+            module_lower = module.lower()
+            if any(pat in module_lower for pat in _GFX90A_EXCLUDE_PATTERNS):
+                exclude_ops.append(module)
+
     for module in all_modules:
+        if module in exclude_ops:
+            continue
         if PREBUILD_KERNELS == 1:
             if "_tune" in module:
                 exclude_ops.append(module)
@@ -308,15 +340,18 @@ class ForcePlatlibDistribution(Distribution):
 if IS_WINDOWS:
     install_requires = ["einops", "packaging", "psutil"]
 else:
-    install_requires = [
+    _base_requires = [
         "pybind11>=3.0.1",
         "ninja",
         "pandas",
         "einops",
         "psutil",
         "packaging",
-        "flydsl==0.1.1+20260401.5ac412e",
     ]
+    if _is_gfx90a_build():
+        install_requires = _base_requires
+    else:
+        install_requires = _base_requires + ["flydsl==0.1.1+20260401.5ac412e"]
 
 setup(
     name=PACKAGE_NAME,

@@ -471,8 +471,8 @@ mha_varlen_fwd(
 
     const int total_q = q.size(0);
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
-    TORCH_CHECK(head_size_q <= 256, "CK only supports head dimension at most 256");
-    TORCH_CHECK(head_size_v <= 256, "CK only supports head dimension at most 256");
+    TORCH_CHECK(head_size_q <= 512, "CK only supports head dimension at most 512");
+    TORCH_CHECK(head_size_v <= 512, "CK only supports head dimension at most 512");
     TORCH_CHECK(head_size_q % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
     TORCH_CHECK(head_size_v % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");

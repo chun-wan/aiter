@@ -1968,6 +1968,11 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    head_dim = q.shape[-1]
+    if head_dim > 256:
+        return _flash_attn_sdpa_fallback(
+            q, k, v, dropout_p, softmax_scale, causal, window_size
+        )
     return FlashAttnFunc.apply(
         q,
         k,
@@ -1988,6 +1993,26 @@ def flash_attn_func(
         cu_seqlens_kv,
         sink_ptr,
     )
+
+
+def _flash_attn_sdpa_fallback(q, k, v, dropout_p, softmax_scale, causal, window_size):
+    """Fallback to PyTorch SDPA for head_dim > 256 (e.g. Gemma 4 full attention layers)."""
+    batch, seqlen, nheads, hdim = q.shape
+    nheads_kv = k.shape[2]
+    scale = softmax_scale if softmax_scale is not None else hdim ** -0.5
+
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+
+    if nheads_kv != nheads:
+        k_t = k_t.repeat_interleave(nheads // nheads_kv, dim=1)
+        v_t = v_t.repeat_interleave(nheads // nheads_kv, dim=1)
+
+    out_t = torch.nn.functional.scaled_dot_product_attention(
+        q_t, k_t, v_t, is_causal=causal, dropout_p=dropout_p, scale=scale,
+    )
+    return out_t.transpose(1, 2)
 
 
 def _flash_attn_varlen_forward(

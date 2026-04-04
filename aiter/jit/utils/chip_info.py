@@ -165,10 +165,19 @@ def _get_pci_chip_id(device_id=0):
 MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
 
 
+GFX90A_NO_FP8 = frozenset({"gfx90a", "gfx908"})
+
+
+def has_fp8_support():
+    return get_gfx() not in GFX90A_NO_FP8
+
+
 def get_device_name():
     gfx = get_gfx()
 
-    if gfx == "gfx942":
+    if gfx == "gfx90a":
+        return "MI250"
+    elif gfx == "gfx942":
         chip_id = _get_pci_chip_id()
         if chip_id in MI308_CHIP_IDS:
             return "MI308"
@@ -176,4 +185,4 @@ def get_device_name():
     elif gfx == "gfx950":
         return "MI350"
     else:
-        raise RuntimeError("Unsupported gfx")
+        return f"unknown-{gfx}"
