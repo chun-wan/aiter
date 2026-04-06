@@ -1,0 +1,10 @@
+knl_name,co_name,tn,tileM,tileN,pf,bPreshuffle,splitK,subK,bias
+// gfx90a (CDNA2) BF16 GEMV kernels for decode (M=1)
+// These use v_dot2c_f32_bf16 for BF16 dot product accumulation
+// Tile configs optimized for MI250 memory bandwidth (1.6 TB/s per GCD)
+_ZN5aiter42bf16gemv_fp32bf16_tn_32x64_bshuffle_splitkE,bf16gemv_fp32bf16_tn_32x64_bshuffle_splitk.co,1,32,64,0,1,0,64,1
+_ZN5aiter42bf16gemv_fp32bf16_tn_64x64_bshuffle_splitkE,bf16gemv_fp32bf16_tn_64x64_bshuffle_splitk.co,1,64,64,0,1,0,64,1
+_ZN5aiter43bf16gemv_fp32bf16_tn_128x64_bshuffle_splitkE,bf16gemv_fp32bf16_tn_128x64_bshuffle_splitk.co,1,128,64,0,1,0,64,1
+_ZN5aiter48bf16gemv_fp32bf16_tn_32x64_bshuffle_splitk_cleanE,bf16gemv_fp32bf16_tn_32x64_bshuffle_splitk_clean.co,1,32,64,0,1,1,64,1
+_ZN5aiter48bf16gemv_fp32bf16_tn_64x64_bshuffle_splitk_cleanE,bf16gemv_fp32bf16_tn_64x64_bshuffle_splitk_clean.co,1,64,64,0,1,1,64,1
+_ZN5aiter49bf16gemv_fp32bf16_tn_128x64_bshuffle_splitk_cleanE,bf16gemv_fp32bf16_tn_128x64_bshuffle_splitk_clean.co,1,128,64,0,1,1,64,1
