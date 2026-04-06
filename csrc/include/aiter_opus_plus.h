@@ -28,6 +28,8 @@ OPUS_D fp32x2_t pk_mul_f32(fp32x2_t a, fp32x2_t b)
 
 // fp32x2 -> fp8x2 with scale + saturation clamp (E4M3)
 // ISA: v_pk_mul_f32 + v_med3_f32 x2 + v_cvt_pk_fp8_f32
+// NOTE: v_cvt_pk_fp8_f32 requires fp8-conversion-insts (gfx942/gfx950 only)
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__)
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 {
@@ -46,6 +48,14 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
                  : "v"(lo), "v"(hi));
     return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
 }
+#else
+// gfx90a fallback: software fp32->fp8 scaled conversion
+template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
+OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
+{
+    return fp8x2_t{fp32_to_fp8(s[0] * inverted_scale), fp32_to_fp8(s[1] * inverted_scale)};
+}
+#endif
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
@@ -57,6 +67,7 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
 
 // fp32x2 -> bf8x2 with scale + saturation clamp (E5M2)
 // ISA: v_pk_mul_f32 + v_med3_f32 x2 + v_cvt_pk_bf8_f32
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__)
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
 {
@@ -71,6 +82,20 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
                  : "v"(lo), "v"(hi));
     return __builtin_bit_cast(bf8x2_t, static_cast<int16_t>(w));
 }
+#else
+// gfx90a fallback: bf8 not natively supported, provide stub
+template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
+OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
+{
+    // BF8 E5M2: simplified software path
+    auto cvt = [](float x) -> bf8_t {
+        unsigned fb = __builtin_bit_cast(unsigned, x);
+        unsigned char r = (unsigned char)((fb >> 24) & 0x80) | (unsigned char)((fb >> 16) & 0x7F);
+        return __builtin_bit_cast(bf8_t, r);
+    };
+    return bf8x2_t{cvt(s[0] * inverted_scale), cvt(s[1] * inverted_scale)};
+}
+#endif
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_bf8_scaled_x4(const S& s, float inverted_scale)

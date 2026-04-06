@@ -1029,6 +1029,7 @@ OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
 // constexpr functions containing GPU builtins (__builtin_amdgcn_cvt_*) that can never be compile-time evaluated.
 // Template constexpr (packed variants, OPUS_CAST_DEFINE) survives because the check is deferred to instantiation.
 // TODO: we may remove constexpr from cast in the future
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__)
 OPUS_D auto fp32_to_fp8(const fp32_t& x) {
     int w; w = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, /*sel=lo*/0);
     return __builtin_bit_cast(fp8_t, static_cast<signed char>(w));
@@ -1037,6 +1038,37 @@ OPUS_D auto fp8_to_fp32(const fp8_t& x) {
     int w = static_cast<int>(__builtin_bit_cast(unsigned char, x));
     return __builtin_amdgcn_cvt_f32_fp8(w, /*byte=*/0);
 }
+#else
+// gfx90a software fallback: FP8 E4M3 FNUZ conversion without HW intrinsics
+OPUS_D auto fp32_to_fp8(const fp32_t& x) {
+    // E4M3 FNUZ: bias=8, no infinity, NaN=0x80
+    float ax = x < 0 ? -x : x;
+    signed char result;
+    if (ax < 1.52587890625e-05f) { result = 0; }               // flush to zero
+    else if (ax > 240.0f)        { result = (x < 0) ? 0xFF : 0x7F; } // clamp to max
+    else {
+        unsigned fb = __builtin_bit_cast(unsigned, ax);
+        int exp = ((fb >> 23) & 0xFF) - 127 + 8;                 // rebias to E4M3
+        int mant = (fb >> 20) & 0x7;                             // 3 mantissa bits
+        if (exp <= 0) { mant = (4 | mant) >> (1 - exp); exp = 0; } // subnormal
+        if (exp > 15) { exp = 15; mant = 7; }                    // saturate
+        result = (signed char)((exp << 3) | mant);
+        if (x < 0) result |= (signed char)0x80;
+    }
+    return __builtin_bit_cast(fp8_t, result);
+}
+OPUS_D auto fp8_to_fp32(const fp8_t& x) {
+    unsigned char raw = __builtin_bit_cast(unsigned char, x);
+    if (raw == 0x80) return __builtin_nanf("");                   // FNUZ NaN
+    int sign = (raw >> 7) & 1;
+    int exp  = (raw >> 3) & 0xF;
+    int mant = raw & 0x7;
+    float r;
+    if (exp == 0) { r = __builtin_ldexpf((float)mant, -10); }    // subnormal: 2^(-bias-mant_bits)
+    else          { r = __builtin_ldexpf(1.0f + mant / 8.0f, exp - 8); }
+    return sign ? -r : r;
+}
+#endif
 OPUS_D constexpr auto fp32_to_fp32(const fp32_t& x) { return x; }
 OPUS_D constexpr auto fp32_to_i8(const fp32_t& x) { return static_cast<i8_t>(x); }
 OPUS_D constexpr auto i8_to_fp32(const i8_t& x) { return static_cast<fp32_t>(x); }
