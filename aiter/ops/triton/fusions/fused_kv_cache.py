@@ -241,6 +241,13 @@ def fused_qk_rope_cat_and_cache_mla(
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
 
 
+
+def _rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
 def fused_qk_rope_reshape_and_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -309,9 +316,41 @@ def fused_qk_rope_reshape_and_cache(
     assert (
         block_size == block_size_v
     ), f"block size should be identical for key_cache, and value_cache {block_size} {block_size_v}"
-    assert (
-        kh == vh == kh_cache == vh_cache
-    ), "KV head should be identical for k, v, key_cache, and value_cache"
+    # Patched: allow mixed head_dim for models like Gemma 4
+    if not (kh == vh == kh_cache == vh_cache):
+        # Fallback: apply RoPE via PyTorch, then update cache separately
+        from aiter.ops.cache import reshape_and_cache
+        # Inline RoPE: q/k have shape [t, heads, d], cos/sin [seq, d_freq]
+        # cos/sin cache may be 4D [max_pos, 1, 1, d_freq] -- flatten to 2D
+        cos_2d = cos.view(cos.shape[0], -1)  # [max_pos, d_freq]
+        sin_2d = sin.view(sin.shape[0], -1)
+        d_freq = cos_2d.shape[-1]
+        cos_pos = cos_2d[pos].unsqueeze(1)  # [t, 1, d_freq]
+        sin_pos = sin_2d[pos].unsqueeze(1)
+        # Apply RoPE to first d_freq dims of q and k
+        q_rope = q.clone()
+        k_rope = k.clone()
+        q1 = q[..., :d_freq]
+        q2 = q[..., d_freq:2*d_freq] if 2*d_freq <= d else torch.zeros_like(q1)
+        q_rope[..., :d_freq] = q1 * cos_pos - q2 * sin_pos
+        if 2*d_freq <= d:
+            q_rope[..., d_freq:2*d_freq] = q2 * cos_pos + q1 * sin_pos
+        k1 = k[..., :d_freq]
+        k2 = k[..., d_freq:2*d_freq] if 2*d_freq <= dk else torch.zeros_like(k1)
+        k_rope[..., :d_freq] = k1 * cos_pos[:tk] - k2 * sin_pos[:tk]
+        if 2*d_freq <= dk:
+            k_rope[..., d_freq:2*d_freq] = k2 * cos_pos[:tk] + k1 * sin_pos[:tk]
+        # Update KV cache
+        reshape_and_cache(k_rope, v, key_cache, value_cache, slot_mapping)
+        if q_out is not None:
+            q_out.copy_(q_rope)
+        else:
+            q_out = q_rope
+        if k_out is not None:
+            k_out.copy_(k_rope)
+        else:
+            k_out = k_rope
+        return q_out, k_out, key_cache, value_cache
     assert (
         t_cache == t_cache_v
     ), "Number of tokens should be identical for key_cache, and value_cache"
