@@ -15,6 +15,99 @@ from ..jit.utils.mha_recipes import (
 )
 from ..utility import dtypes
 
+# --- gfx12 (RDNA4) Triton Flash Attention fallback ---
+_RDNA_FA_ENABLED = get_gfx().startswith("gfx12")
+
+if _RDNA_FA_ENABLED:
+    from ..ops.triton._triton_kernels.flash_attn_triton_amd.fwd_prefill import (
+        attention_forward_prefill_triton_impl as _triton_prefill_impl,
+    )
+    from ..ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
+        USE_EXP2 as _TRITON_USE_EXP2,
+    )
+
+
+def _triton_fa_varlen_forward(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+    dropout_p, softmax_scale, causal, window_size_left, window_size_right,
+    alibi_slopes=None, return_lse=False,
+):
+    """Triton flash attention for varlen (thd) layout on RDNA4."""
+    total_q, nheads_q, hdim = q.shape
+
+    out = torch.zeros_like(q)
+    softmax_lse = torch.zeros(
+        (nheads_q, total_q), device=q.device, dtype=torch.float32,
+    )
+
+    _triton_prefill_impl(
+        q, k, v, out, softmax_lse,
+        None,           # sd_mask
+        softmax_scale,
+        alibi_slopes,
+        causal,
+        window_size_left,
+        window_size_right,
+        None,           # bias
+        "thd",          # layout
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        0, 0,           # philox_seed, philox_offset
+        False,          # return_scores
+        _TRITON_USE_EXP2,
+        None, None, None,   # fp8 descales
+        None, None,          # seqused
+        None, None, False, None,  # rotary
+    )
+
+    rng_state = torch.as_tensor([0, 0])
+    return out, softmax_lse, None, rng_state
+
+
+def _triton_fa_forward(
+    q, k, v, dropout_p, softmax_scale, causal, window_size_left, window_size_right,
+    alibi_slopes=None, return_lse=False,
+):
+    """Triton flash attention for batch (bshd) layout on RDNA4."""
+    batch, seqlen_q, nheads_q, hdim = q.shape
+    _, seqlen_k, _, _ = k.shape
+
+    out = torch.zeros_like(q)
+    softmax_lse = torch.zeros(
+        (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32,
+    )
+
+    _triton_prefill_impl(
+        q, k, v, out, softmax_lse,
+        None,           # sd_mask
+        softmax_scale,
+        alibi_slopes,
+        causal,
+        window_size_left,
+        window_size_right,
+        None,           # bias
+        "bshd",         # layout
+        None, None,     # cu_seqlens
+        seqlen_q,
+        seqlen_k,
+        dropout_p,
+        0, 0,           # philox_seed, philox_offset
+        False,          # return_scores
+        _TRITON_USE_EXP2,
+        None, None, None,   # fp8 descales
+        None, None,          # seqused
+        None, None, False, None,  # rotary
+    )
+
+    rng_state = torch.as_tensor([0, 0])
+    return out, softmax_lse, None, rng_state
+
+# --- end gfx12 Triton FA fallback ---
+
+
 
 def cmdGenFunc_mha_fwd(
     q: Tensor,
@@ -1310,6 +1403,12 @@ def _flash_attn_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
+    if _RDNA_FA_ENABLED:
+        return _triton_fa_forward(
+            q, k, v, dropout_p, softmax_scale, causal,
+            window_size_left, window_size_right, alibi_slopes, return_lse,
+        )
+
     # Validate newly added optional cumulative length / padded arrays if provided.
     # They are currently only plumbed through for future CK support enabling per-batch padding.
     def _validate_cu(name: str, x: Optional[torch.Tensor]):
@@ -2072,6 +2171,13 @@ def _flash_attn_varlen_forward(
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+
+    if _RDNA_FA_ENABLED:
+        return _triton_fa_varlen_forward(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            dropout_p, softmax_scale, causal, window_size_left, window_size_right,
+            alibi_slopes, return_lse,
+        )
 
     if can_impl_fmha_v3_fwd():
         out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
