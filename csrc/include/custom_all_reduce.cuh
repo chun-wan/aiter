@@ -171,14 +171,20 @@ DINLINE void start_sync(const RankSignals& sg,
     {
         // simultaneously write to the corresponding flag of all ranks.
         // Latency = 1 p2p write
+        // The peer store below is SYSTEM scope, but a DEVICE-scope spin-load
+        // can be served from L2 and never observe it on gfx950 (CDNA4), which
+        // does not invalidate L2 every iteration -> the barrier livelocks under
+        // sustained high-concurrency load. Pair a RELEASE store with a SYSTEM
+        // scope ACQUIRE load so every iteration re-fetches to the system
+        // coherence point and forward progress is guaranteed.
         __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
                                 flag,
-                                __ATOMIC_RELAXED,
+                                __ATOMIC_RELEASE,
                                 __MEMORY_SCOPE_SYSTEM);
         // wait until we got true from all ranks
         while(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
-                                     __ATOMIC_RELAXED,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+                                     __ATOMIC_ACQUIRE,
+                                     __MEMORY_SCOPE_SYSTEM) < flag)
             ;
     }
     __syncthreads();
@@ -223,14 +229,19 @@ DINLINE void end_sync(const RankSignals& sg,
     {
         // simultaneously write to the corresponding flag of all ranks.
         // Latency = 1 p2p write
+        // Same gfx950 (CDNA4) livelock fix as start_sync: a DEVICE-scope
+        // spin-load can hit stale L2 and never see the peer's SYSTEM-scope
+        // store. Use a SYSTEM-scope RELEASE store paired with a SYSTEM-scope
+        // ACQUIRE load so each iteration re-fetches to the system coherence
+        // point. A relaxed system load is not enough here.
         __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
                                 flag,
-                                final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
+                                __ATOMIC_RELEASE,
                                 __MEMORY_SCOPE_SYSTEM);
         // wait until we got true from all ranks
         while(__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                                     final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+                                     __ATOMIC_ACQUIRE,
+                                     __MEMORY_SCOPE_SYSTEM) < flag)
             ;
     }
     __syncthreads();
